@@ -16,8 +16,10 @@
 #include "libslic3r/Point.hpp"
 #include "libslic3r/libslic3r.h"
 #include <pybind11/stl.h>
+#include <algorithm> // std::all_of (append_path level check)
 #include <memory>
 #include <string>
+#include <utility>   // std::move (set_points / append_path)
 #include <vector>
 #include "libslic3r/Config.hpp"
 #include "libslic3r/ObjectID.hpp"
@@ -74,6 +76,40 @@ static void refresh_lslices_bboxes(Layer& l)
     for (const ExPolygon& island : l.lslices)
         l.lslices_bboxes.emplace_back(get_extents(island));
 }
+
+// One (N,3) int64 ndarray -> Points3, the vertex buffer of an ExtrusionPath polyline.
+// Same contract as parse_polygon() in PluginHostGeometry.cpp. That helper is file-local
+// there, and moving it into a header would force a long rebuild, so the few lines are
+// repeated here. The checks reject malformed input up front, before the toolpath changes:
+//  - Only a signed 8-byte integer dtype (coord_t == int64) is accepted. A float array is
+//    almost always a units slip (millimeters instead of scaled coords), and integer arrays
+//    cannot hold NaN or inf, so neither can reach the G-code writer.
+//  - The shape must be (N,3): the x, y, z columns that ExtrusionPath.points() hands out.
+//  - N >= 2: a path is a chain of segments, and the G-code writer reads the first and the
+//    last point of every path without checking that they exist.
+static Points3 parse_points3(py::handle h, const char* who)
+{
+    if (!py::isinstance<py::array>(h))
+        throw py::value_error(std::string(who) + ": points must be an (N,3) int64 ndarray");
+    py::array a = py::reinterpret_borrow<py::array>(h);
+    if (a.dtype().kind() != 'i' || a.itemsize() != (py::ssize_t) sizeof(coord_t))
+        throw py::value_error(std::string(who) + ": points must be int64 (scaled coords)");
+    if (a.ndim() != 2 || a.shape(1) != 3)
+        throw py::value_error(std::string(who) + ": points must have shape (N,3)");
+    if (a.shape(0) < 2)
+        throw py::value_error(std::string(who) + ": a path needs at least 2 points");
+    // The dtype is already checked as int64. forcecast here only guarantees a C-contiguous
+    // buffer: a strided view such as pts[::2] is a valid input but not contiguous memory.
+    auto arr = py::array_t<coord_t, py::array::c_style | py::array::forcecast>::ensure(a);
+    if (!arr)
+        throw py::value_error(std::string(who) + ": could not read points as a contiguous int64 array");
+    auto r = arr.unchecked<2>();
+    Points3 pts;
+    pts.reserve((size_t) arr.shape(0));
+    for (py::ssize_t i = 0; i < arr.shape(0); ++i)
+        pts.emplace_back((coord_t) r(i, 0), (coord_t) r(i, 1), (coord_t) r(i, 2));
+    return pts;
+}
 } // namespace
 
 void host_bindings::register_slicing(py::module_& host)
@@ -88,9 +124,10 @@ void host_bindings::register_slicing(py::module_& host)
     // the Print. References — and every numpy view they hand out — are valid
     // only while the plugin hook (execute(ctx)) runs, and a container-replacing
     // mutator (SurfaceCollection.set / append / clear, Polygon.set_points / append,
-    // ExPolygon.set_holes) invalidates previously obtained references into that
-    // container, exactly as std::vector operations invalidate C++ iterators. Do
-    // not stash references or arrays across execute() calls; copy what you need.
+    // ExPolygon.set_holes, ExtrusionPath.set_points, ExtrusionEntityCollection.remove /
+    // clear) invalidates previously obtained references into that container, exactly
+    // as std::vector operations invalidate C++ iterators. Do not stash references or
+    // arrays across execute() calls; copy what you need.
     // ------------------------------------------------------------------
 
     py::enum_<SurfaceType>(host, "SurfaceType")
@@ -168,7 +205,9 @@ void host_bindings::register_slicing(py::module_& host)
         }, "Surfaces as [Surface] references into the live collection. Invalidated by "
            "set()/append()/clear() on this collection (C++ vector semantics).");
 
-    // --- Extrusion tree (read-only). Registered polymorphically: when a returned
+    // --- Extrusion tree. Reads work as upstream. The zs fork adds the writable toolpath:
+    // ExtrusionPath setters (set_points, width, height, mm3_per_mm, z_contoured) and the
+    // collection mutators (append_path, remove, clear). Registered polymorphically: when a returned
     // ExtrusionEntity*'s dynamic type IS one of the classes registered below, pybind
     // hands the plugin that concrete type, so plugins walk the same tree shape C++ does.
     // When the dynamic type is NOT registered (e.g. ExtrusionLoopSloped, produced with
@@ -191,9 +230,44 @@ void host_bindings::register_slicing(py::module_& host)
             });
         }, "Path vertices as a read-only int64 (N,3) numpy view in scaled coords "
            "(the polyline is natively 3D on this branch). Requires numpy.")
-        .def_readonly("width", &ExtrusionPath::width)
-        .def_readonly("height", &ExtrusionPath::height)
-        .def_readonly("mm3_per_mm", &ExtrusionPath::mm3_per_mm);
+        // set_points() installs a NEW buffer instead of handing out a writable view. The
+        // polyline and its arc-fitting cache must change together, and only a call can
+        // clear the cache at the moment the points change.
+        .def("set_points", [](ExtrusionPath& p, py::handle src) {
+            // Parse first: a malformed array raises ValueError and leaves the path untouched.
+            Points3 pts = parse_points3(src, "ExtrusionPath.set_points");
+            p.polyline.points = std::move(pts);
+            // fitting_result caches the G2/G3 arcs that arc fitting computed from the OLD
+            // points at posSimplifyPath. For a flat path with arc fitting on, GCode.cpp
+            // prints that cache instead of the points, so a stale cache would print the
+            // old geometry. An empty cache makes the writer emit G1 segments through the
+            // new points. (A z_contoured path skips arc fitting anyway, GCode.cpp
+            // _extrude_piece, but loop splitting and clipping still read the cache.)
+            p.polyline.fitting_result.clear();
+        }, py::arg("points"),
+           "Replace all vertices from an (N,3) int64 ndarray in scaled coords, the layout "
+           "points() returns (x, y, z). N >= 2. Clears the cached arc fitting, so the path "
+           "prints as G1 segments. z is an offset from the layer's print_z, used only when "
+           "z_contoured is True. Invalidates arrays previously returned by points(). Inside a "
+           "loop, keep the end points of neighbouring paths equal. Raises ValueError on "
+           "malformed input.")
+        // The four scalars below are plain data members that the G-code writer reads when
+        // it emits the path, so direct read-write access is enough: no cache depends on them.
+        .def_readwrite("width", &ExtrusionPath::width,
+            "Extrusion width in mm. Read-write. The preview draws it. The extruded volume "
+            "comes from mm3_per_mm, not from width.")
+        .def_readwrite("height", &ExtrusionPath::height,
+            "Extrusion height in mm (the layer thickness this path fills). Read-write. With "
+            "z_contoured, the writer scales the E of each segment by (height + dz) / height.")
+        .def_readwrite("mm3_per_mm", &ExtrusionPath::mm3_per_mm,
+            "Extruded volume per mm of head motion, in mm^3/mm. Read-write. The writer "
+            "derives E from it.")
+        .def_readwrite("z_contoured", &ExtrusionPath::z_contoured,
+            "False (default): the z column is ignored and the path prints flat at the layer Z. "
+            "True: each point prints at Z = layer Z + unscale(z), the E of each segment is "
+            "scaled by (height + dz) / height with dz the z offset of the segment's end point "
+            "(Ironing excepted), arc fitting is skipped, and the travel into the path ends at "
+            "the Z of its first point.");
 
     py::class_<ExtrusionLoop, ExtrusionEntity, std::unique_ptr<ExtrusionLoop, py::nodelete>>(host, "ExtrusionLoop")
         .def_property_readonly("paths", [](py::object self) {
@@ -236,7 +310,67 @@ void host_bindings::register_slicing(py::module_& host)
                                     py::return_value_policy::reference_internal, self));
             return out;
         }, "Every leaf ExtrusionPath under this tree (collections recursed into, "
-           "loops/multipaths decomposed).");
+           "loops/multipaths decomposed).")
+        .def("append_path", [](py::object self, const std::string& role, py::handle points, float width,
+                               float height, double mm3_per_mm, bool z_contoured) {
+            ExtrusionEntityCollection& c = self.cast<ExtrusionEntityCollection&>();
+            // Level check. The top level of LayerRegion.perimeters / .fills holds one child
+            // collection per island, and GCode.cpp (the island loop of process_layer)
+            // static_casts every child at that level to ExtrusionEntityCollection*. Its
+            // assert is compiled out of Release builds, so a bare path there would be read
+            // as a collection: undefined behavior, not an error. A collection that is empty
+            // (its level cannot be told) or holds only collections is therefore refused.
+            // Islands hold loops and paths, so appending to an island always passes.
+            const bool collections_only = std::all_of(c.entities.begin(), c.entities.end(),
+                [](const ExtrusionEntity* e) { return e->is_collection(); });
+            if (collections_only)
+                throw py::value_error("ExtrusionEntityCollection.append_path: this collection is empty or "
+                                      "holds only collections (e.g. the top level of LayerRegion.perimeters "
+                                      "or .fills); append to one of its child collections instead");
+            // string_to_role() maps the strings .role returns ("Inner wall", "Sparse infill",
+            // ...) back to the enum. It returns erNone for an unknown string. erMixed
+            // ("Multiple") only describes a collection. Neither can label one path.
+            const ExtrusionRole er = ExtrusionEntity::string_to_role(role);
+            if (er == erNone || er == erMixed)
+                throw py::value_error("ExtrusionEntityCollection.append_path: unknown or non-path role '" + role + "'");
+            // The writer multiplies by mm3_per_mm and divides by height, so 0, a negative
+            // value or NaN would print nothing, pull filament back, or emit inf.
+            // `!(x > 0)` is also true for NaN, which `x <= 0` would let through.
+            if (!(width > 0.f) || !(height > 0.f) || !(mm3_per_mm > 0.))
+                throw py::value_error("ExtrusionEntityCollection.append_path: width, height and mm3_per_mm must be > 0");
+            // Build the path in C++. Python only ever holds non-owning (py::nodelete)
+            // references into the Print's graph, so a path made in Python could never be
+            // handed over. The collection owns its children as raw pointers and deletes
+            // them in clear(), remove() and its destructor. append() moves this stack
+            // object into a heap copy that the collection owns from then on.
+            ExtrusionPath path(er, mm3_per_mm, width, height);
+            path.polyline.points = parse_points3(points, "ExtrusionEntityCollection.append_path");
+            path.z_contoured = z_contoured;
+            c.append(std::move(path));
+            // Hand the new child back as a live reference, same policy as .entities, so
+            // the plugin can keep editing it. reference_internal keeps this collection's
+            // Python object alive while the reference exists.
+            return py::cast(c.entities.back(), py::return_value_policy::reference_internal, self);
+        }, py::arg("role"), py::arg("points"), py::arg("width"), py::arg("height"), py::arg("mm3_per_mm"),
+           py::arg("z_contoured") = false,
+           "Append a new ExtrusionPath built in C++ and return it. role: a string as .role "
+           "returns (\"Inner wall\", \"Sparse infill\", ...). points: (N,3) int64 scaled coords, "
+           "as for set_points(). width and height in mm, mm3_per_mm in mm^3/mm, all > 0. A new "
+           "path carries no overhang data. Refused (ValueError) on an empty collection or one "
+           "that holds only collections, such as the top level of LayerRegion.perimeters or "
+           ".fills: append to one of its island collections. Existing references stay valid.")
+        .def("remove", [](ExtrusionEntityCollection& c, py::ssize_t index) {
+            // C++ remove() indexes the vector without a check, so the bounds check is here.
+            if (index < 0 || static_cast<size_t>(index) >= c.entities.size())
+                throw py::index_error("ExtrusionEntityCollection.remove: index out of range");
+            c.remove(static_cast<size_t>(index));
+        }, py::arg("index"),
+           "Delete the child at index (0 <= index < size()). The child and everything under "
+           "it is freed: a reference to it (from .entities or flatten_paths()) must not be "
+           "used again, and later children move down by one index.")
+        .def("clear", [](ExtrusionEntityCollection& c) { c.clear(); },
+             "Delete every child. Every reference into this collection becomes invalid. An "
+             "empty island prints nothing.");
 
     py::class_<PrintRegion, std::unique_ptr<PrintRegion, py::nodelete>>(host, "PrintRegion")
         .def("config_keys", [](const PrintRegion& r) { return r.config().keys(); })
@@ -254,9 +388,12 @@ void host_bindings::register_slicing(py::module_& host)
         .def_readonly("fill_surfaces", &LayerRegion::fill_surfaces,
             "Surfaces prepared for infill (SurfaceCollection). Edit in place or via fill_surfaces.set(...).")
         .def_readonly("perimeters", &LayerRegion::perimeters,
-            "Perimeter toolpaths (ExtrusionEntityCollection, read-only).")
+            "Perimeter toolpaths (ExtrusionEntityCollection): one child collection per island, "
+            "each holding loops and paths. Edit paths through the ExtrusionPath setters and "
+            "islands through append_path / remove / clear.")
         .def_readonly("fills", &LayerRegion::fills,
-            "Infill toolpaths (ExtrusionEntityCollection, read-only).")
+            "Infill toolpaths (ExtrusionEntityCollection): one child collection per fill "
+            "group. Same editing rules as perimeters.")
         .def("layer", [](LayerRegion& r) -> py::object {
             Layer* l = r.layer();
             if (l == nullptr)
