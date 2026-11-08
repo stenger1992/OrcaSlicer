@@ -370,7 +370,21 @@ void host_bindings::register_slicing(py::module_& host)
            "used again, and later children move down by one index.")
         .def("clear", [](ExtrusionEntityCollection& c) { c.clear(); },
              "Delete every child. Every reference into this collection becomes invalid. An "
-             "empty island prints nothing.");
+             "empty island prints nothing.")
+        // no_sort is a plain data member that the G-code writer reads when it emits the layer,
+        // so direct read-write access is enough. What it does depends on the level:
+        //  - On a fill group (a child of LayerRegion.fills or .perimeters), it is honoured.
+        //    GCode::ObjectByExtruder::Island::Region::append adds a group with no_sort set as ONE
+        //    unit instead of spilling its paths into the chain list, and GCode::extrude_infill
+        //    then prints that unit's children in stored order (it skips the re-chaining when
+        //    no_sort is set). The unit itself is still placed among the region's other units by
+        //    travel distance, and it is never reversed (can_reverse() is false with no_sort).
+        //  - On the top level (LayerRegion.fills itself), GCode.cpp never reads it.
+        .def_readwrite("no_sort", &ExtrusionEntityCollection::no_sort,
+            "Read-write. True: the G-code writer prints this collection's children in stored "
+            "order (no travel re-chaining, no reversal). Honoured on a fill group, the child "
+            "of LayerRegion.fills / .perimeters; the group itself is still ordered among the "
+            "region's other groups by travel. Ignored on the top-level collection.");
 
     py::class_<PrintRegion, std::unique_ptr<PrintRegion, py::nodelete>>(host, "PrintRegion")
         .def("config_keys", [](const PrintRegion& r) { return r.config().keys(); })
