@@ -72,6 +72,7 @@
 #include <atomic>
 #include <new>
 #include <optional>
+#include <chrono>
 
 #if defined(__linux__) || defined(__LINUX__)
 #include <condition_variable>
@@ -173,6 +174,13 @@ using json = nlohmann::json;
     // which only a SLIC3R_GUI build links (see target_link_libraries(OrcaSlicer libslic3r_gui)
     // in CMakeLists).
     #include "slic3r/Utils/BBLPrinterAgent.hpp"
+    // Slicing-pipeline plugins (CliPipelinePlugins below). The plugin host and the post-processor
+    // that runs the plugins' G-code step live in libslic3r_gui too, for the same reason.
+    #include "slic3r/plugin/PluginManager.hpp"
+    #include "slic3r/plugin/PluginFsUtils.hpp"
+    #include "slic3r/plugin/PythonInterpreter.hpp"
+    #include "slic3r/plugin/PythonPluginInterface.hpp"
+    #include "slic3r/GUI/PostProcessor.hpp"
 #endif /* SLIC3R_GUI */
 
 using namespace Slic3r;
@@ -531,6 +539,144 @@ static void cli_report_config_substitutions(const std::string &file, const Confi
                                           {"old_value", subst.old_value}, {"new_value", new_value}});
     }
 }
+
+#ifdef SLIC3R_GUI
+// Slicing-pipeline plugins in a CLI slice.
+//
+// A process preset selects Python plugins in "slicing_pipeline_plugin" (bare capability names).
+// Its "plugins" list names the plugin behind each capability ("name;uuid;capability").
+// In the GUI, GUI_App starts the plugin system at launch. PluginManager::initialize() starts the
+// bundled Python and installs the hook that Print::process() calls after each pipeline step.
+// GUI_App then discovers and loads the plugins. The CLI did none of this. Print found no hook,
+// kept m_pipeline_plugin_active false and ignored the selection.
+// This class does the slicing part of that startup for one CLI run, so plugin tests run headless.
+//
+// This class omits, on purpose, each part that needs the GUI or a login: the Plugins dialog,
+// printer agents, plugin pages, the menu action registry, cloud plugins, and the automatic load of
+// every plugin that the GUI has enabled. The CLI loads only the plugins that the config names.
+// A permission prompt also needs the GUI. Without it, the audit manager refuses each request that
+// has no stored grant.
+class CliPipelinePlugins
+{
+public:
+    // Runs when CLI::run() returns, on every return path. It stops the plugins first and Python
+    // second: the order of GUI_App at exit and of the plugin unit tests after their last case.
+    // The static destructors would do this too late, after boost::log and other statics are gone.
+    ~CliPipelinePlugins()
+    {
+        if (!m_started)
+            return;
+        PluginManager::instance().shutdown();
+        PythonInterpreter::instance().shutdown();
+    }
+
+    // Starts Python, scans <datadir>/orca_plugins and loads each plugin that the config names, with
+    // the named capabilities enabled. Returns false, with the reason in `error`, when a named
+    // capability cannot run. A slice that skipped it would look like a valid plugin result.
+    bool start(const DynamicPrintConfig &config, std::string &error)
+    {
+        // No capability name, no start: a slice without a plugin stays the same as before. An empty
+        // name selects nothing (the pipeline hook skips it too), so it must not start Python either.
+        const auto *caps = config.option<ConfigOptionStrings>("slicing_pipeline_plugin");
+        if (caps == nullptr ||
+            std::none_of(caps->values.begin(), caps->values.end(), [](const std::string &name) { return !name.empty(); }))
+            return true;
+
+        // The plugins, their Python packages and the Python log all live below the data dir.
+        // Without --datadir the CLI has no data dir, and all of them would go to the working directory.
+        if (data_dir().empty()) {
+            error = "slicing-pipeline plugins need --datadir. Orca loads plugins from <datadir>/orca_plugins.";
+            return false;
+        }
+
+        // Group the selected capabilities by plugin through the "plugins" list. This is the lookup of
+        // the pipeline hook (execute_capabilities_from_refs): the key of a local plugin is its name,
+        // the key of a cloud plugin is its UUID.
+        const auto *manifest = config.option<ConfigOptionStrings>("plugins");
+        std::map<std::string, std::vector<std::string>> by_plugin;
+        for (const std::string &cap : caps->values) {
+            if (cap.empty())
+                continue;
+            std::optional<PluginCapabilityRef> ref;
+            if (manifest != nullptr)
+                for (const std::string &entry : manifest->values)
+                    if (auto parsed = parse_capability_ref(entry); parsed && parsed->capability_name == cap) {
+                        ref = std::move(parsed);
+                        break;
+                    }
+            if (!ref) {
+                error = "slicing-pipeline capability '" + cap +
+                        "' has no entry in the \"plugins\" list of the config (name;uuid;capability)";
+                return false;
+            }
+            by_plugin[ref->uuid.empty() ? ref->name : ref->uuid].push_back(cap);
+        }
+
+        // Set before initialize(): a runtime that started even in part must stop at the end.
+        m_started = true;
+        PluginManager &manager = PluginManager::instance();
+        // initialize() starts CPython, which must start on the main thread. CLI::run() runs there.
+        // It also installs the hook, so Print::process() runs the selected plugins at each step.
+        if (!manager.initialize()) {
+            error = "slicing-pipeline plugins need the bundled Python runtime, which did not start: " +
+                    PythonInterpreter::instance().last_error();
+            return false;
+        }
+        // A synchronous scan of <datadir>/orca_plugins, as GUI_App does at startup.
+        manager.discover_plugins(/*async=*/false, /*clear=*/true);
+
+        for (const auto &[plugin_key, plugin_caps] : by_plugin) {
+            // The load enables the named capabilities, also when the GUI has them disabled. The GUI
+            // does the same when the user activates a plugin that a preset references
+            // (resolve_inactive_plugins, PluginResolver.cpp). skip_deps = false: the loader first
+            // installs the Python packages that the plugin declares, with the bundled uv.
+            manager.load_plugin(plugin_key, /*skip_deps=*/false, plugin_caps);
+            // The load runs on a worker thread. 5 minutes is the limit of the GUI for this wait
+            // (PluginResolver.cpp). The package install alone can take 2 minutes (PluginLoader.cpp).
+            // A load that never ends still blocks the exit: PluginManager::shutdown() in the
+            // destructor waits for every load. The error message at least names the plugin first.
+            std::string load_error;
+            if (!manager.wait_for_plugin_load(plugin_key, std::chrono::minutes(5), load_error) ||
+                !manager.is_plugin_loaded(plugin_key)) {
+                error = "slicing-pipeline plugin '" + plugin_key + "' did not load from " + get_orca_plugins_dir() + ": " +
+                        (load_error.empty() ? std::string("unknown error") : load_error);
+                return false;
+            }
+            for (const std::string &cap : plugin_caps)
+                if (!manager.get_plugin_capability({PluginCapabilityType::SlicingPipeline, cap, plugin_key}, /*only_enabled=*/true)) {
+                    error = "slicing-pipeline plugin '" + plugin_key + "' has no slicing-pipeline capability '" + cap + "'";
+                    return false;
+                }
+        }
+        m_active = true;
+        BOOST_LOG_TRIVIAL(info) << "slicing-pipeline plugins loaded: " << caps->serialize();
+        return true;
+    }
+
+    // True when every selected capability is loaded and enabled.
+    bool active() const { return m_active; }
+
+    // Runs the last pipeline step, psGCodePostProcess, on one exported G-code file. The GUI runs it
+    // through run_post_process_scripts() (PostProcessor.cpp) after each export. The CLI calls the
+    // same function, so the plugin gets the same context (ctx.gcode_path, host "File",
+    // ctx.output_name, ctx.config_value()). A failure throws the same ExportError, and the catch of
+    // the caller exits non-zero. Two differences from the GUI, both on purpose:
+    //  * No working copy. The GUI copies the file because its G-code viewer maps the original into
+    //    memory. The CLI has no viewer, so the plugin edits the exported file in place.
+    //  * No "post_process" scripts. The CLI never ran them (the call after the export is a comment),
+    //    so this copy of the config has no scripts, and only the plugins run.
+    static void post_process(std::string gcode_path, const DynamicPrintConfig &full_config)
+    {
+        DynamicPrintConfig config = full_config;
+        config.erase("post_process");
+        run_post_process_scripts(gcode_path, config);
+    }
+
+private:
+    bool m_started = false; // Python can be running, so the destructor must stop it
+    bool m_active  = false; // every selected capability is loaded and enabled
+};
+#endif /* SLIC3R_GUI */
 
 void record_exit_reson(std::string outputdir, int code, int plate_id, std::string error_message, sliced_info_t& sliced_info, std::map<std::string, std::string> key_values = std::map<std::string, std::string>())
 {
@@ -6280,6 +6426,22 @@ int CLI::run(int argc, char **argv)
                 o->ensure_on_bed();
     }
 
+#ifdef SLIC3R_GUI
+    // Slicing-pipeline plugins start once, here, after the config is final and before an action
+    // slices. They start only for a slice and only when the config selects a plugin. Otherwise
+    // nothing starts, and the slice is the same as before. The object lives to the end of run(),
+    // and its destructor stops the plugins and Python.
+    CliPipelinePlugins pipeline_plugins;
+    if (std::find(m_actions.begin(), m_actions.end(), "slice") != m_actions.end()) {
+        std::string plugin_error;
+        if (!pipeline_plugins.start(m_print_config, plugin_error)) {
+            boost::nowide::cerr << "error: " << plugin_error << std::endl;
+            record_exit_reson(outfile_dir, CLI_ENVIRONMENT_ERROR, 0, plugin_error, sliced_info);
+            flush_and_exit(CLI_ENVIRONMENT_ERROR);
+        }
+    }
+#endif /* SLIC3R_GUI */
+
     // loop through action options
     bool export_to_3mf = false, load_slicedata = false, export_slicedata = false, export_slicedata_error = false;
     bool no_check = false;
@@ -7234,6 +7396,13 @@ int CLI::run(int argc, char **argv)
                                 }*/
                                 // Run the post-processing scripts if defined.
                                 //run_post_process_scripts(outfile, print->full_print_config());
+#ifdef SLIC3R_GUI
+                                // The selected plugins get their last step, psGCodePostProcess, on the
+                                // exported file, as in a GUI export. A plugin failure throws, and the
+                                // catch below ends the run non-zero.
+                                if (pipeline_plugins.active())
+                                    CliPipelinePlugins::post_process(outfile, print->full_print_config());
+#endif /* SLIC3R_GUI */
                                 BOOST_LOG_TRIVIAL(info) << "Slicing result exported to " << outfile << std::endl;
                                 part_plate->update_slice_result_valid_state(true);
 #if defined(__linux__) || defined(__LINUX__)
