@@ -300,6 +300,7 @@ void ExtrusionLoop::split_at(const Point &point, bool prefer_non_overhang, const
     ExtrusionPath p1(path.role(), path.mm3_per_mm, path.width, path.height);
     ExtrusionPath p2(path.role(), path.mm3_per_mm, path.width, path.height);
     p1.z_contoured = p2.z_contoured = path.z_contoured;
+    p1.flow_follows_z = p2.flow_follows_z = path.flow_follows_z;
     path.polyline.split_at(p, &p1.polyline, &p2.polyline);
 
     if (this->paths.size() == 1) {

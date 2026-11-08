@@ -10086,7 +10086,9 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
                         coordf_t z_diff = unscale_(line.b.z());
 
                         double extrusion_ratio = 1;
-                        if (path.role() != erIroning) {
+                        // flow_follows_z false: the layer below carries the same z offsets, the
+                        // gap under the bead stays path.height, so E is not scaled.
+                        if (path.role() != erIroning && path.flow_follows_z) {
                             extrusion_ratio = (path.height + z_diff) / path.height;
                         }
 
@@ -10294,7 +10296,8 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
                 coordf_t z_diff = unscale_(processed_point.p.z());
 
                 double extrusion_ratio = 1;
-                if (path.role() != erIroning) {
+                // flow_follows_z false: no E scaling, as at the first site above.
+                if (path.role() != erIroning && path.flow_follows_z) {
                     extrusion_ratio = (path.height + z_diff) / path.height;
                 }
 

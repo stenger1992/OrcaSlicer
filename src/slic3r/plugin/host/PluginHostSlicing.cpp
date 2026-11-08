@@ -266,8 +266,15 @@ void host_bindings::register_slicing(py::module_& host)
             "False (default): the z column is ignored and the path prints flat at the layer Z. "
             "True: each point prints at Z = layer Z + unscale(z), the E of each segment is "
             "scaled by (height + dz) / height with dz the z offset of the segment's end point "
-            "(Ironing excepted), arc fitting is skipped, and the travel into the path ends at "
-            "the Z of its first point.");
+            "(Ironing excepted, and not when flow_follows_z is False), arc fitting is skipped, "
+            "and the travel into the path ends at the Z of its first point.")
+        // A plain data member that the G-code writer reads at its two E-scaling sites
+        // (GCode.cpp, _extrude_piece and the segmented emission path), so direct access is enough.
+        .def_readwrite("flow_follows_z", &ExtrusionPath::flow_follows_z,
+            "Read only for a z_contoured path. True (default): the writer scales the E of each "
+            "segment by (height + dz) / height, right for a bead over a flat layer below. False: "
+            "no scaling, right when the layer below carries the same z offsets (the gap under "
+            "the bead stays `height`). Copied when Orca splits or copies the path.");
 
     py::class_<ExtrusionLoop, ExtrusionEntity, std::unique_ptr<ExtrusionLoop, py::nodelete>>(host, "ExtrusionLoop")
         .def_property_readonly("paths", [](py::object self) {
