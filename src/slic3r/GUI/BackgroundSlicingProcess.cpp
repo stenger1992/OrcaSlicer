@@ -44,10 +44,15 @@
 #include "libslic3r/Thread.hpp"
 #include "libslic3r/libslic3r.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <stdexcept>
 #include <cctype>
 
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/split.hpp>
+#include <boost/algorithm/string/trim.hpp>
 #include <boost/format/format_fwd.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <boost/log/trivial.hpp>
@@ -744,6 +749,57 @@ StringObjectException BackgroundSlicingProcess::validate(std::vector<StringObjec
     return m_print->validate(warnings, collison_polygons, height_polygons);
 }
 
+// Fork (zs): default slicing-pipeline plugins for the GUI.
+// WHAT: the environment variable ORCA_DEFAULT_SLICING_PLUGINS names the plugins to use when the
+//       process preset selects no slicing-pipeline plugin. The variable is unset on a normal
+//       install, and then this function changes nothing.
+// FORMAT: one or more entries "name;uuid;capability" (the format of the "plugins" manifest key),
+//       separated by '|'. Example: zstrength;;Z-strength
+// WHY HERE: apply() is the one place where the GUI hands the full config to the Print. The
+//       presets, the settings tabs and the saved project files stay unchanged. The CLI builds
+//       its config in another place, so a CLI slice never gets a default plugin.
+// LIMIT: a preset that selects a plugin keeps its own selection. The key is absent in SLA mode.
+static void apply_default_slicing_plugins(DynamicPrintConfig& config)
+{
+    const char* env = std::getenv("ORCA_DEFAULT_SLICING_PLUGINS");
+    if (env == nullptr || *env == '\0')
+        return;
+    const auto* selected = config.option<ConfigOptionStrings>("slicing_pipeline_plugin");
+    if (selected == nullptr ||
+        std::any_of(selected->values.begin(), selected->values.end(), [](const std::string& s) { return !s.empty(); }))
+        return;
+
+    // Keep the manifest entries the presets already carry. The dispatcher resolves each selected
+    // capability through this list, so the default entries must be added to it.
+    std::vector<std::string> manifest;
+    if (const auto* plugins = config.option<ConfigOptionStrings>("plugins"))
+        manifest = plugins->values;
+
+    std::vector<std::string> entries;
+    const std::string        text(env);
+    boost::split(entries, text, boost::is_any_of("|"));
+    std::vector<std::string> capabilities;
+    for (std::string entry : entries) {
+        boost::trim(entry);
+        if (entry.empty())
+            continue;
+        // The same parser the dispatcher uses, so an entry accepted here resolves there too.
+        const auto parsed = parse_capability_ref(entry);
+        if (!parsed || parsed->capability_name.empty()) {
+            BOOST_LOG_TRIVIAL(warning) << "ORCA_DEFAULT_SLICING_PLUGINS: entry '" << entry
+                                       << "' is not name;uuid;capability, ignored";
+            continue;
+        }
+        capabilities.emplace_back(parsed->capability_name);
+        if (std::find(manifest.begin(), manifest.end(), entry) == manifest.end())
+            manifest.emplace_back(entry);
+    }
+    if (capabilities.empty())
+        return;
+    config.set_key_value("slicing_pipeline_plugin", new ConfigOptionStrings(capabilities));
+    config.set_key_value("plugins", new ConfigOptionStrings(manifest));
+}
+
 // Apply config over the print. Returns false, if the new config values caused any of the already
 // processed steps to be invalidated, therefore the task will need to be restarted.
 Print::ApplyStatus BackgroundSlicingProcess::apply(const Model& model, const DynamicPrintConfig& config)
@@ -753,6 +809,7 @@ Print::ApplyStatus BackgroundSlicingProcess::apply(const Model& model, const Dyn
     // TODO: add partplate config
     DynamicPrintConfig new_config = config;
     new_config.apply(*m_current_plate->config());
+    apply_default_slicing_plugins(new_config);
     Print::ApplyStatus invalidated = m_print->apply(model, new_config);
 
     // Orca: prevent resetting under gcode viewer mode
